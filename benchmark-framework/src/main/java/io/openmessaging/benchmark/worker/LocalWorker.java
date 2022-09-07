@@ -2,9 +2,9 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- *
+ * <p>
  * http://www.apache.org/licenses/LICENSE-2.0
- *
+ * <p>
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -25,6 +25,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
 
 import io.openmessaging.benchmark.utils.UniformRateLimiter;
@@ -103,6 +104,8 @@ public class LocalWorker implements Worker, ConsumerCallback {
     private boolean testCompleted = false;
 
     private boolean consumersArePaused = false;
+
+    private AtomicInteger windowsSize = new AtomicInteger(256);
 
     public LocalWorker() {
         this(NullStatsLogger.INSTANCE);
@@ -217,33 +220,41 @@ public class LocalWorker implements Worker, ConsumerCallback {
             try {
                 while (!testCompleted) {
                     producers.forEach(producer -> {
+                        synchronized (windowsSize) {
+                            while (windowsSize.get() <= 0) {
+                                Thread.yield();
+                            }
+                        }
+                        windowsSize.decrementAndGet();
                         byte[] payloadData = payloadCount == 0 ? firstPayload : payloads.get(r.nextInt(payloadCount));
                         final long intendedSendTime = rateLimiter.acquire();
                         uninterruptibleSleepNs(intendedSendTime);
                         final long sendTime = System.nanoTime();
                         producer.sendAsync(Optional.ofNullable(keyDistributor.next()), payloadData)
                                 .thenRun(() -> {
-                            messagesSent.increment();
-                            totalMessagesSent.increment();
-                            messagesSentCounter.inc();
-                            bytesSent.add(payloadData.length);
-                            bytesSentCounter.add(payloadData.length);
+                                    windowsSize.incrementAndGet();
+                                    messagesSent.increment();
+                                    totalMessagesSent.increment();
+                                    messagesSentCounter.inc();
+                                    bytesSent.add(payloadData.length);
+                                    bytesSentCounter.add(payloadData.length);
 
-                            final long latencyMicros = Math.min(highestTrackableValue,
-                                    TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - sendTime));
-                            publishLatencyRecorder.recordValue(latencyMicros);
-                            cumulativePublishLatencyRecorder.recordValue(latencyMicros);
-                            publishLatencyStats.registerSuccessfulEvent(latencyMicros, TimeUnit.MICROSECONDS);
+                                    final long latencyMicros = Math.min(highestTrackableValue,
+                                            TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - sendTime));
+                                    publishLatencyRecorder.recordValue(latencyMicros);
+                                    cumulativePublishLatencyRecorder.recordValue(latencyMicros);
+                                    publishLatencyStats.registerSuccessfulEvent(latencyMicros, TimeUnit.MICROSECONDS);
 
-                            final long sendDelayMicros = Math.min(highestTrackableValue,
-                                    TimeUnit.NANOSECONDS.toMicros(sendTime - intendedSendTime));
-                            publishDelayLatencyRecorder.recordValue(sendDelayMicros);
-                            cumulativePublishDelayLatencyRecorder.recordValue(sendDelayMicros);
-                            publishDelayLatencyStats.registerSuccessfulEvent(sendDelayMicros, TimeUnit.MICROSECONDS);
-                        }).exceptionally(ex -> {
-                            log.warn("Write error on message", ex);
-                            return null;
-                        });
+                                    final long sendDelayMicros = Math.min(highestTrackableValue,
+                                            TimeUnit.NANOSECONDS.toMicros(sendTime - intendedSendTime));
+                                    publishDelayLatencyRecorder.recordValue(sendDelayMicros);
+                                    cumulativePublishDelayLatencyRecorder.recordValue(sendDelayMicros);
+                                    publishDelayLatencyStats.registerSuccessfulEvent(sendDelayMicros, TimeUnit.MICROSECONDS);
+                                }).exceptionally(ex -> {
+                                    windowsSize.incrementAndGet();
+                                    log.warn("Write error on message", ex);
+                                    return null;
+                                });
                     });
                 }
             } catch (Throwable t) {
@@ -254,7 +265,7 @@ public class LocalWorker implements Worker, ConsumerCallback {
 
     @Override
     public void adjustPublishRate(double publishRate) {
-        if(publishRate < 1.0) {
+        if (publishRate < 1.0) {
             rateLimiter = new UniformRateLimiter(1.0);
             return;
         }
